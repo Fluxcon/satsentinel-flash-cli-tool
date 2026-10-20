@@ -1,0 +1,230 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "satsentinel-cli-v*"
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    name: Build Linux x64
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install ".[dev]" pyinstaller
+
+      - name: Build
+        run: pyinstaller satsentinel_flash.spec
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: satsentinel-cli-linux
+          path: dist/satsentinel-cli
+          retention-days: 2
+
+  build-macos:
+    name: Build macOS arm64
+    runs-on: macos-14        # Apple Silicon runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install ".[dev]" pyinstaller
+
+      - name: Build
+        run: pyinstaller satsentinel_flash.spec
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: satsentinel-cli-macos
+          path: dist/satsentinel-cli
+          retention-days: 2
+
+  build-windows:
+    name: Build Windows x64
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install ".[dev]" pyinstaller
+
+      - name: Build
+        run: pyinstaller satsentinel_flash.spec
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: satsentinel-cli-win64
+          path: dist/satsentinel-cli.exe
+          retention-days: 2
+
+  release:
+    name: GitHub Release
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Package binaries
+        run: |
+          chmod +x dist/satsentinel-cli-linux/satsentinel-cli
+          chmod +x dist/satsentinel-cli-macos/satsentinel-cli
+
+          mkdir satsentinel-cli
+          cp dist/satsentinel-cli-linux/satsentinel-cli satsentinel-cli/
+          cp LICENSE satsentinel-cli/
+          zip -r dist/satsentinel-cli-linux.zip satsentinel-cli
+          rm -rf satsentinel-cli
+
+          mkdir satsentinel-cli
+          cp dist/satsentinel-cli-macos/satsentinel-cli satsentinel-cli/
+          cp LICENSE satsentinel-cli/
+          zip -r dist/satsentinel-cli-macos.zip satsentinel-cli
+          rm -rf satsentinel-cli
+
+          mkdir satsentinel-cli
+          cp dist/satsentinel-cli-win64/satsentinel-cli.exe satsentinel-cli/
+          cp LICENSE satsentinel-cli/
+          zip -r dist/satsentinel-cli-win64.zip satsentinel-cli
+          rm -rf satsentinel-cli
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/satsentinel-cli-linux.zip
+            dist/satsentinel-cli-macos.zip
+            dist/satsentinel-cli-win64.zip
+
+      - name: Delete old releases from public firmware repo
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_REPO_PAT }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          gh release list --repo Fluxcon/satsentinel-firmware --limit 100 --json tagName \
+            | jq -r '.[].tagName' \
+            | grep '^satsentinel-cli-v' \
+            | grep -v "^${VERSION}$" \
+            | while read -r tag; do
+                echo "Deleting release $tag"
+                gh release delete "$tag" --repo Fluxcon/satsentinel-firmware --yes --cleanup-tag
+              done
+
+      - name: Publish to public firmware repo
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_REPO_PAT }}
+        run: |
+          VERSION="${{ github.ref_name }}"
+          gh release create "$VERSION" \
+            dist/satsentinel-cli-linux.zip \
+            dist/satsentinel-cli-macos.zip \
+            dist/satsentinel-cli-win64.zip \
+            --repo Fluxcon/satsentinel-firmware \
+            --title "$VERSION" \
+            --notes "Flash tool release $VERSION. Source (GPL-3.0-or-later): https://github.com/Fluxcon/satsentinel-flash-cli-tool/tree/$VERSION"
+
+      - name: Update public repo README
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_REPO_PAT }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          python3 - <<'EOF'
+          import base64, json, subprocess, re, os, sys, textwrap
+
+          version = os.environ['VERSION']
+
+          r = subprocess.run(
+              ['gh', 'api', '/repos/Fluxcon/satsentinel-firmware/contents/README.md'],
+              capture_output=True, text=True, check=True
+          )
+          data = json.loads(r.stdout)
+          content = base64.b64decode(data['content']).decode()
+          sha = data['sha']
+
+          new_section = textwrap.dedent(f"""\
+          <!-- section:flash-tool -->
+          ## Flash Tool
+
+          Latest: `{version}` — [Download](https://github.com/Fluxcon/satsentinel-firmware/releases/tag/{version})
+
+          | File | Platform |
+          |------|----------|
+          | `satsentinel-cli-linux.zip` | Linux x64 |
+          | `satsentinel-cli-macos.zip` | macOS arm64 |
+          | `satsentinel-cli-win64.zip` | Windows x64 |
+
+          ### Linux
+
+          ```bash
+          unzip satsentinel-cli-linux.zip
+          cd satsentinel-cli
+          ./satsentinel-cli
+          ```
+
+          ### macOS
+
+          ```bash
+          unzip satsentinel-cli-macos.zip
+          xattr -d com.apple.quarantine satsentinel-cli/satsentinel-cli
+          cd satsentinel-cli
+          ./satsentinel-cli
+          ```
+
+          > The `xattr` command removes the Gatekeeper quarantine flag macOS applies to downloaded files. Only required on first run.
+
+          ### Windows
+
+          Extract `satsentinel-cli-win64.zip` and run `satsentinel-cli\\satsentinel-cli.exe`. Windows may show a SmartScreen warning — click **More info -> Run anyway**.
+          <!-- /section:flash-tool -->""")
+
+          pattern = r'<!-- section:flash-tool -->.*?<!-- /section:flash-tool -->'
+
+          if re.search(pattern, content, flags=re.DOTALL):
+              new_content = re.sub(pattern, lambda m: new_section, content, flags=re.DOTALL)
+              if new_content == content:
+                  print("README section unchanged, skipping")
+                  sys.exit(0)
+          else:
+              print("README section not found, appending")
+              new_content = content.rstrip('\n') + '\n\n' + new_section + '\n'
+
+          payload = json.dumps({
+              'message': f'docs: update flash tool section to {version}',
+              'content': base64.b64encode(new_content.encode()).decode(),
+              'sha': sha
+          })
+          subprocess.run(
+              ['gh', 'api', '--method', 'PUT',
+               '/repos/Fluxcon/satsentinel-firmware/contents/README.md',
+               '--input', '-'],
+              input=payload, text=True, check=True
+          )
+          print(f"README updated to {version}")
+          EOF
